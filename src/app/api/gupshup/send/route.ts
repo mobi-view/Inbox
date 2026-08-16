@@ -1,22 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { createClient as createServerClient } from "@/lib/supabase/server";
-import { decrypt } from "@/lib/whatsapp/encryption";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 function getAdminClient() {
-  const url =
-    process.env.NEXT_PUBLIC_SUPABASE_URL;
-
-  const key =
-    process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
   if (!url || !key) {
-    throw new Error(
-      "Supabase environment variables are missing"
-    );
+    throw new Error("Supabase environment variables are missing");
   }
 
   return createClient(url, key, {
@@ -27,57 +21,36 @@ function getAdminClient() {
   });
 }
 
-export async function POST(
-  request: NextRequest
-) {
+export async function POST(request: NextRequest) {
   try {
-    const supabase =
-      await createServerClient();
+    const supabase = await createServerClient();
 
     const {
       data: { user },
     } = await supabase.auth.getUser();
 
     if (!user) {
-      return NextResponse.json(
-        {
-          error: "Unauthorized",
-        },
-        { status: 401 }
-      );
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const body =
-      await request.json();
-
-    const {
-      destination,
-      text,
-      conversation_id,
-    } = body;
+    const body = await request.json();
+    const { destination, text, conversation_id } = body;
 
     if (!destination) {
       return NextResponse.json(
-        {
-          error:
-            "destination is required",
-        },
+        { error: "destination is required" },
         { status: 400 }
       );
     }
 
     if (!text) {
       return NextResponse.json(
-        {
-          error:
-            "text is required",
-        },
+        { error: "text is required" },
         { status: 400 }
       );
     }
 
-    const admin =
-      getAdminClient();
+    const admin = getAdminClient();
 
     /*
     --------------------------------------------------------
@@ -85,19 +58,15 @@ export async function POST(
     --------------------------------------------------------
     */
 
-    const { data: profile } =
-      await admin
-        .from("profiles")
-        .select("account_id")
-        .eq("user_id", user.id)
-        .maybeSingle();
+    const { data: profile } = await admin
+      .from("profiles")
+      .select("account_id")
+      .eq("user_id", user.id)
+      .maybeSingle();
 
     if (!profile?.account_id) {
       return NextResponse.json(
-        {
-          error:
-            "Account not found",
-        },
+        { error: "Account not found" },
         { status: 404 }
       );
     }
@@ -105,62 +74,28 @@ export async function POST(
     /*
     --------------------------------------------------------
     Get Gupshup configuration
+    (separate table from Meta's whatsapp_config)
     --------------------------------------------------------
     */
 
-    const {
-      data: config,
-      error: configError,
-    } = await admin
-      .from("whatsapp_config")
-      .select(
-        "id, phone_number_id, waba_id, access_token, status"
-      )
-      .eq(
-        "account_id",
-        profile.account_id
-      )
-      .eq(
-        "status",
-        "connected"
-      )
+    const { data: config, error: configError } = await admin
+      .from("gupshup_config")
+      .select("id, app_name, source_number, api_key, status")
+      .eq("account_id", profile.account_id)
+      .eq("status", "connected")
       .maybeSingle();
 
-    if (
-      configError ||
-      !config
-    ) {
+    if (configError || !config) {
       return NextResponse.json(
-        {
-          error:
-            "Gupshup WhatsApp is not connected.",
-        },
+        { error: "Gupshup WhatsApp is not connected." },
         { status: 400 }
       );
     }
 
-    /*
-    --------------------------------------------------------
-    Decrypt Gupshup API key
-    --------------------------------------------------------
-    */
-
-    let apiKey: string;
-
-    try {
-      apiKey =
-        decrypt(
-          config.access_token
-        );
-    } catch {
-      return NextResponse.json(
-        {
-          error:
-            "Unable to decrypt Gupshup API key.",
-        },
-        { status: 500 }
-      );
-    }
+    // NOTE: api_key is stored as plain text in gupshup_config for now.
+    // If you later encrypt it on insert (recommended before production),
+    // decrypt it here the same way — see the encryption note below.
+    const apiKey = config.api_key;
 
     /*
     --------------------------------------------------------
@@ -168,66 +103,38 @@ export async function POST(
     --------------------------------------------------------
     */
 
-    const gupshupResponse =
-      await fetch(
-        "https://api.gupshup.io/wa/api/v1/msg",
-        {
-          method: "POST",
-
-          headers: {
-            apikey: apiKey,
-
-            "Content-Type":
-              "application/x-www-form-urlencoded",
-          },
-
-          body:
-            new URLSearchParams({
-              channel:
-                "whatsapp",
-
-              source:
-                config.phone_number_id,
-
-              destination:
-                String(destination),
-
-              "src.name":
-                config.waba_id,
-
-              message:
-                JSON.stringify({
-                  type: "text",
-                  text: String(text),
-                }),
-            }),
-        }
-      );
-
-    const responseText =
-      await gupshupResponse.text();
-
-    console.log(
-      "[Gupshup SEND]",
-      gupshupResponse.status,
-      responseText
+    const gupshupResponse = await fetch(
+      "https://api.gupshup.io/wa/api/v1/msg",
+      {
+        method: "POST",
+        headers: {
+          apikey: apiKey,
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({
+          channel: "whatsapp",
+          source: config.source_number,
+          destination: String(destination),
+          "src.name": config.app_name,
+          message: JSON.stringify({
+            type: "text",
+            text: String(text),
+          }),
+        }),
+      }
     );
 
-    if (
-      !gupshupResponse.ok
-    ) {
+    const responseText = await gupshupResponse.text();
+
+    console.log("[Gupshup SEND]", gupshupResponse.status, responseText);
+
+    if (!gupshupResponse.ok) {
       return NextResponse.json(
         {
-          error:
-            "Gupshup rejected the message.",
-
-          details:
-            responseText,
+          error: "Gupshup rejected the message.",
+          details: responseText,
         },
-        {
-          status:
-            gupshupResponse.status,
-        }
+        { status: gupshupResponse.status }
       );
     }
 
@@ -240,14 +147,9 @@ export async function POST(
     let gupshupResult: any;
 
     try {
-      gupshupResult =
-        JSON.parse(
-          responseText
-        );
+      gupshupResult = JSON.parse(responseText);
     } catch {
-      gupshupResult = {
-        raw: responseText,
-      };
+      gupshupResult = { raw: responseText };
     }
 
     /*
@@ -258,35 +160,17 @@ export async function POST(
 
     if (conversation_id) {
       const messageId =
-        gupshupResult?.messageId ||
-        gupshupResult?.message_id ||
-        null;
+        gupshupResult?.messageId || gupshupResult?.message_id || null;
 
-      const {
-        error: messageError,
-      } = await admin
-        .from("messages")
-        .insert({
-          conversation_id,
-
-          sender_type:
-            "agent",
-
-          content_type:
-            "text",
-
-          content_text:
-            String(text),
-
-          message_id:
-            messageId,
-
-          status:
-            "sent",
-
-          created_at:
-            new Date().toISOString(),
-        });
+      const { error: messageError } = await admin.from("messages").insert({
+        conversation_id,
+        sender_type: "agent",
+        content_type: "text",
+        content_text: String(text),
+        message_id: messageId,
+        status: "sent",
+        created_at: new Date().toISOString(),
+      });
 
       if (messageError) {
         console.error(
@@ -298,42 +182,25 @@ export async function POST(
       await admin
         .from("conversations")
         .update({
-          last_message_text:
-            String(text),
-
-          last_message_at:
-            new Date().toISOString(),
-
-          updated_at:
-            new Date().toISOString(),
+          last_message_text: String(text),
+          last_message_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
         })
-        .eq(
-          "id",
-          conversation_id
-        );
+        .eq("id", conversation_id);
     }
 
     return NextResponse.json({
       success: true,
-
-      provider:
-        "gupshup",
-
-      gupshup:
-        gupshupResult,
+      provider: "gupshup",
+      gupshup: gupshupResult,
     });
   } catch (error) {
-    console.error(
-      "[Gupshup SEND] Error:",
-      error
-    );
+    console.error("[Gupshup SEND] Error:", error);
 
     return NextResponse.json(
       {
         error:
-          error instanceof Error
-            ? error.message
-            : "Internal server error",
+          error instanceof Error ? error.message : "Internal server error",
       },
       { status: 500 }
     );

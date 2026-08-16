@@ -69,17 +69,11 @@ export async function POST(request: NextRequest) {
 
     const phone = payload?.sender?.phone;
 
-    const name =
-      payload?.sender?.name ||
-      phone ||
-      "WhatsApp Contact";
+    const name = payload?.sender?.name || phone || "WhatsApp Contact";
 
     const messageType = payload?.type || "text";
 
-    const text =
-      messageType === "text"
-        ? payload?.payload?.text || ""
-        : "";
+    const text = messageType === "text" ? payload?.payload?.text || "" : "";
 
     if (!messageId) {
       console.error("Missing message ID");
@@ -114,94 +108,85 @@ export async function POST(request: NextRequest) {
     });
 
     // ---------------------------------------------------------
-    // 3. Find WhatsApp configuration
+    // 3. Find Gupshup configuration by app name
     //
-    // IMPORTANT:
-    // Your table has:
-    //
-    // id
-    // user_id
-    // phone_number_id
-    // waba_id
-    // access_token
-    // verify_token
-    // status
-    // account_id
-    //
+    // Gupshup sends the app name in body.app — this is how we
+    // identify which account/tenant this webhook call belongs to.
+    // This table is separate from whatsapp_config (which is
+    // dedicated to Meta's official Cloud API) so the two providers
+    // never collide.
     // ---------------------------------------------------------
 
-    const { data: configs, error: configError } =
-      await supabaseAdmin
-        .from("whatsapp_config")
-        .select(
-          "id, user_id, account_id, phone_number_id, waba_id, status"
-        )
-        .eq("status", "connected")
-        .limit(10);
+    const appName = body?.app;
 
-    if (configError) {
-      console.error(
-        "[Gupshup] whatsapp_config query error:",
-        configError
-      );
+    if (!appName) {
+      console.error("[Gupshup] Missing app name in payload");
 
       return NextResponse.json(
         {
           success: false,
-          error: "Failed to read WhatsApp configuration",
+          error: "Missing app name",
+        },
+        { status: 400 }
+      );
+    }
+
+    const { data: config, error: configError } = await supabaseAdmin
+      .from("gupshup_config")
+      .select("id, account_id, user_id, status")
+      .eq("app_name", appName)
+      .eq("status", "connected")
+      .maybeSingle();
+
+    if (configError) {
+      console.error("[Gupshup] gupshup_config query error:", configError);
+
+      return NextResponse.json(
+        {
+          success: false,
+          error: "Failed to read Gupshup configuration",
         },
         { status: 500 }
       );
     }
 
-    if (!configs || configs.length === 0) {
-      console.error("[Gupshup] No connected whatsapp_config found");
+    if (!config) {
+      console.error(
+        "[Gupshup] No connected gupshup_config found for app:",
+        appName
+      );
 
       return NextResponse.json(
         {
           success: false,
-          error: "No connected WhatsApp configuration found",
+          error: "No connected Gupshup configuration found",
         },
         { status: 404 }
       );
     }
 
-    // ---------------------------------------------------------
-    // 4. Use the first connected account
-    //
-    // If you have only one WhatsApp account, this is enough.
-    // ---------------------------------------------------------
-
-    const config = configs[0];
-
     const accountId = config.account_id;
     const userId = config.user_id;
 
     if (!accountId) {
-      console.error(
-        "[Gupshup] whatsapp_config has no account_id",
-        config
-      );
+      console.error("[Gupshup] gupshup_config has no account_id", config);
 
       return NextResponse.json(
         {
           success: false,
-          error: "WhatsApp configuration has no account_id",
+          error: "Gupshup configuration has no account_id",
         },
         { status: 500 }
       );
     }
 
     if (!userId) {
-      console.error(
-        "[Gupshup] whatsapp_config has no user_id",
-        config
-      );
+      console.error("[Gupshup] gupshup_config has no user_id", config);
 
       return NextResponse.json(
         {
           success: false,
-          error: "WhatsApp configuration has no user_id",
+          error: "Gupshup configuration has no user_id",
         },
         { status: 500 }
       );
@@ -211,48 +196,39 @@ export async function POST(request: NextRequest) {
     console.log("[Gupshup] Using user:", userId);
 
     // ---------------------------------------------------------
-    // 5. Find contact
+    // 4. Find contact
     // ---------------------------------------------------------
 
     let contact;
 
-    const {
-      data: existingContact,
-      error: contactFindError,
-    } = await supabaseAdmin
-      .from("contacts")
-      .select("*")
-      .eq("account_id", accountId)
-      .eq("phone", phone)
-      .maybeSingle();
+    const { data: existingContact, error: contactFindError } =
+      await supabaseAdmin
+        .from("contacts")
+        .select("*")
+        .eq("account_id", accountId)
+        .eq("phone", phone)
+        .maybeSingle();
 
     if (contactFindError) {
-      console.error(
-        "[Gupshup] Contact lookup error:",
-        contactFindError
-      );
+      console.error("[Gupshup] Contact lookup error:", contactFindError);
     }
 
     // ---------------------------------------------------------
-    // 6. Existing contact
+    // 5. Existing contact
     // ---------------------------------------------------------
 
     if (existingContact) {
       contact = existingContact;
 
       // Update name if changed
-      if (
-        name &&
-        name !== existingContact.name
-      ) {
-        const { error: updateContactError } =
-          await supabaseAdmin
-            .from("contacts")
-            .update({
-              name,
-              updated_at: new Date().toISOString(),
-            })
-            .eq("id", existingContact.id);
+      if (name && name !== existingContact.name) {
+        const { error: updateContactError } = await supabaseAdmin
+          .from("contacts")
+          .update({
+            name,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", existingContact.id);
 
         if (updateContactError) {
           console.error(
@@ -264,33 +240,26 @@ export async function POST(request: NextRequest) {
     }
 
     // ---------------------------------------------------------
-    // 7. Create contact
+    // 6. Create contact
     // ---------------------------------------------------------
 
     else {
-      console.log(
-        "[Gupshup] Contact not found. Creating..."
-      );
+      console.log("[Gupshup] Contact not found. Creating...");
 
-      const {
-        data: newContact,
-        error: contactCreateError,
-      } = await supabaseAdmin
-        .from("contacts")
-        .insert({
-          account_id: accountId,
-          user_id: userId,
-          phone,
-          name,
-        })
-        .select("*")
-        .single();
+      const { data: newContact, error: contactCreateError } =
+        await supabaseAdmin
+          .from("contacts")
+          .insert({
+            account_id: accountId,
+            user_id: userId,
+            phone,
+            name,
+          })
+          .select("*")
+          .single();
 
       if (contactCreateError) {
-        console.error(
-          "[Gupshup] Contact creation error:",
-          contactCreateError
-        );
+        console.error("[Gupshup] Contact creation error:", contactCreateError);
 
         return NextResponse.json(
           {
@@ -305,30 +274,25 @@ export async function POST(request: NextRequest) {
       contact = newContact;
     }
 
-    console.log(
-      "[Gupshup] Contact:",
-      contact.id
-    );
+    console.log("[Gupshup] Contact:", contact.id);
 
     // ---------------------------------------------------------
-    // 8. Find conversation
+    // 7. Find conversation
     // ---------------------------------------------------------
 
     let conversation;
 
-    const {
-      data: existingConversation,
-      error: conversationFindError,
-    } = await supabaseAdmin
-      .from("conversations")
-      .select("*")
-      .eq("account_id", accountId)
-      .eq("contact_id", contact.id)
-      .order("created_at", {
-        ascending: false,
-      })
-      .limit(1)
-      .maybeSingle();
+    const { data: existingConversation, error: conversationFindError } =
+      await supabaseAdmin
+        .from("conversations")
+        .select("*")
+        .eq("account_id", accountId)
+        .eq("contact_id", contact.id)
+        .order("created_at", {
+          ascending: false,
+        })
+        .limit(1)
+        .maybeSingle();
 
     if (conversationFindError) {
       console.error(
@@ -338,7 +302,7 @@ export async function POST(request: NextRequest) {
     }
 
     // ---------------------------------------------------------
-    // 9. Existing conversation
+    // 8. Existing conversation
     // ---------------------------------------------------------
 
     if (existingConversation) {
@@ -346,26 +310,22 @@ export async function POST(request: NextRequest) {
     }
 
     // ---------------------------------------------------------
-    // 10. Create conversation
+    // 9. Create conversation
     // ---------------------------------------------------------
 
     else {
-      console.log(
-        "[Gupshup] Conversation not found. Creating..."
-      );
+      console.log("[Gupshup] Conversation not found. Creating...");
 
-      const {
-        data: newConversation,
-        error: conversationCreateError,
-      } = await supabaseAdmin
-        .from("conversations")
-        .insert({
-          account_id: accountId,
-          user_id: userId,
-          contact_id: contact.id,
-        })
-        .select("*")
-        .single();
+      const { data: newConversation, error: conversationCreateError } =
+        await supabaseAdmin
+          .from("conversations")
+          .insert({
+            account_id: accountId,
+            user_id: userId,
+            contact_id: contact.id,
+          })
+          .select("*")
+          .single();
 
       if (conversationCreateError) {
         console.error(
@@ -377,8 +337,7 @@ export async function POST(request: NextRequest) {
           {
             success: false,
             error: "Failed to create conversation",
-            details:
-              conversationCreateError.message,
+            details: conversationCreateError.message,
           },
           { status: 500 }
         );
@@ -387,40 +346,26 @@ export async function POST(request: NextRequest) {
       conversation = newConversation;
     }
 
-    console.log(
-      "[Gupshup] Conversation:",
-      conversation.id
-    );
+    console.log("[Gupshup] Conversation:", conversation.id);
 
     // ---------------------------------------------------------
-    // 11. Prevent duplicate messages
+    // 10. Prevent duplicate messages
     // ---------------------------------------------------------
 
-    const {
-      data: existingMessage,
-      error: duplicateCheckError,
-    } = await supabaseAdmin
-      .from("messages")
-      .select("id")
-      .eq(
-        "conversation_id",
-        conversation.id
-      )
-      .eq("message_id", messageId)
-      .maybeSingle();
+    const { data: existingMessage, error: duplicateCheckError } =
+      await supabaseAdmin
+        .from("messages")
+        .select("id")
+        .eq("conversation_id", conversation.id)
+        .eq("message_id", messageId)
+        .maybeSingle();
 
     if (duplicateCheckError) {
-      console.error(
-        "[Gupshup] Duplicate check error:",
-        duplicateCheckError
-      );
+      console.error("[Gupshup] Duplicate check error:", duplicateCheckError);
     }
 
     if (existingMessage) {
-      console.log(
-        "[Gupshup] Duplicate message:",
-        messageId
-      );
+      console.log("[Gupshup] Duplicate message:", messageId);
 
       return NextResponse.json({
         success: true,
@@ -429,7 +374,7 @@ export async function POST(request: NextRequest) {
     }
 
     // ---------------------------------------------------------
-    // 12. Determine content type
+    // 11. Determine content type
     // ---------------------------------------------------------
 
     let contentType = "text";
@@ -472,56 +417,39 @@ export async function POST(request: NextRequest) {
     }
 
     // ---------------------------------------------------------
-    // 13. Convert timestamp
+    // 12. Convert timestamp
     // ---------------------------------------------------------
 
-    let createdAt =
-      new Date().toISOString();
+    let createdAt = new Date().toISOString();
 
     if (body?.timestamp) {
-      const timestampNumber =
-        Number(body.timestamp);
+      const timestampNumber = Number(body.timestamp);
 
       if (!Number.isNaN(timestampNumber)) {
-        createdAt = new Date(
-          timestampNumber
-        ).toISOString();
+        createdAt = new Date(timestampNumber).toISOString();
       }
     }
 
     // ---------------------------------------------------------
-    // 14. Insert message
+    // 13. Insert message
     // ---------------------------------------------------------
 
-    const {
-      data: newMessage,
-      error: messageError,
-    } = await supabaseAdmin
+    const { data: newMessage, error: messageError } = await supabaseAdmin
       .from("messages")
       .insert({
         conversation_id: conversation.id,
-
         sender_type: "customer",
-
         content_type: contentType,
-
-        content_text:
-          text || null,
-
+        content_text: text || null,
         message_id: messageId,
-
         status: "delivered",
-
         created_at: createdAt,
       })
       .select("*")
       .single();
 
     if (messageError) {
-      console.error(
-        "[Gupshup] Message insert error:",
-        messageError
-      );
+      console.error("[Gupshup] Message insert error:", messageError);
 
       return NextResponse.json(
         {
@@ -533,41 +461,23 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    console.log(
-      "[Gupshup] Message saved:",
-      newMessage.id
-    );
+    console.log("[Gupshup] Message saved:", newMessage.id);
 
     // ---------------------------------------------------------
-    // 15. Update conversation
+    // 14. Update conversation
     // ---------------------------------------------------------
 
-    const currentUnread =
-      Number(
-        conversation.unread_count || 0
-      );
+    const currentUnread = Number(conversation.unread_count || 0);
 
-    const {
-      error: conversationUpdateError,
-    } = await supabaseAdmin
+    const { error: conversationUpdateError } = await supabaseAdmin
       .from("conversations")
       .update({
-        last_message_text:
-          text || `[${messageType}]`,
-
-        last_message_at:
-          createdAt,
-
-        unread_count:
-          currentUnread + 1,
-
-        updated_at:
-          new Date().toISOString(),
+        last_message_text: text || `[${messageType}]`,
+        last_message_at: createdAt,
+        unread_count: currentUnread + 1,
+        updated_at: new Date().toISOString(),
       })
-      .eq(
-        "id",
-        conversation.id
-      );
+      .eq("id", conversation.id);
 
     if (conversationUpdateError) {
       console.error(
@@ -577,69 +487,32 @@ export async function POST(request: NextRequest) {
     }
 
     // ---------------------------------------------------------
-    // 16. DONE
+    // 15. DONE
     // ---------------------------------------------------------
 
-    console.log(
-      "====================================="
-    );
-
-    console.log(
-      "[Gupshup] MESSAGE SUCCESSFULLY SAVED"
-    );
-
-    console.log(
-      "Account:",
-      accountId
-    );
-
-    console.log(
-      "Contact:",
-      contact.id
-    );
-
-    console.log(
-      "Conversation:",
-      conversation.id
-    );
-
-    console.log(
-      "Message:",
-      newMessage.id
-    );
-
-    console.log(
-      "====================================="
-    );
+    console.log("=====================================");
+    console.log("[Gupshup] MESSAGE SUCCESSFULLY SAVED");
+    console.log("Account:", accountId);
+    console.log("Contact:", contact.id);
+    console.log("Conversation:", conversation.id);
+    console.log("Message:", newMessage.id);
+    console.log("=====================================");
 
     return NextResponse.json({
       success: true,
-
-      messageId:
-        newMessage.id,
-
-      conversationId:
-        conversation.id,
-
-      contactId:
-        contact.id,
-
-      accountId:
-        accountId,
+      messageId: newMessage.id,
+      conversationId: conversation.id,
+      contactId: contact.id,
+      accountId: accountId,
     });
   } catch (error) {
-    console.error(
-      "[Gupshup] Webhook fatal error:",
-      error
-    );
+    console.error("[Gupshup] Webhook fatal error:", error);
 
     return NextResponse.json(
       {
         success: false,
         error:
-          error instanceof Error
-            ? error.message
-            : "Invalid webhook request",
+          error instanceof Error ? error.message : "Invalid webhook request",
       },
       { status: 500 }
     );
