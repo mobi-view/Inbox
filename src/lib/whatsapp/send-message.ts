@@ -6,17 +6,23 @@
 // Given a conversation and message params, this:
 //   1. validates the params for the message type,
 //   2. loads the conversation + contact + WhatsApp config,
-//   3. sends to Meta (with phone-variant retry + contact auto-fix),
+//   3. sends via the configured provider (Meta or Gupshup),
 //   4. persists the message + updates the conversation,
 //   5. pauses any active Flow run for the contact (agent stepped in).
+//
+// Provider resolution: this account's `whatsapp_config` row (Meta) is
+// checked first; if there isn't one, we fall back to a connected
+// `gupshup_config` row. Only 'text' messages are currently supported
+// on the Gupshup path — Gupshup's template/media/interactive APIs use
+// a different shape than Meta's and aren't wired up yet, so those
+// message types throw a clear 'unsupported_for_gupshup' error instead
+// of silently misbehaving.
 //
 // It is transport-agnostic: it takes a `SupabaseClient` and an
 // `accountId` and throws `SendMessageError` on failure. The callers
 // own auth, rate-limiting, body parsing, and mapping the error to
 // their respective response shapes (internal `{ error }` vs the v1
-// envelope). Behaviour is identical to the original inline route —
-// this is a straight extraction so the public endpoint can reuse it
-// without duplicating ~250 lines of Meta plumbing.
+// envelope).
 // ============================================================
 
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -29,6 +35,7 @@ import {
   sendInteractiveList,
   type MediaKind,
 } from '@/lib/whatsapp/meta-api';
+import { sendGupshupTextMessage } from '@/lib/whatsapp/gupshup-api';
 import {
   validateInteractivePayload,
   interactivePayloadPreviewText,
@@ -89,17 +96,10 @@ export interface SendMessageParams {
 export interface SendMessageResult {
   /** Our `messages.id` (the persisted row). */
   messageId: string;
-  /** Meta's `wamid` for the delivered message. */
+  /** The provider's message id (Meta's `wamid` or Gupshup's messageId) for the delivered message. */
   whatsappMessageId: string;
 }
 
-/**
- * Send a message in an existing conversation and persist it.
- *
- * `db` may be an RLS-scoped user client (dashboard) or the service-
- * role client (public API) — every query is filtered by `accountId`
- * either way, so tenancy holds regardless of which client is passed.
- */
 /**
  * Validate the message-shape params (type, required content, caption
  * cap) independently of any DB state, throwing `SendMessageError` on a
@@ -247,20 +247,143 @@ export async function sendMessageToConversation(
     );
   }
 
-  // WhatsApp config, account-scoped.
-  const { data: config, error: configError } = await db
+  // ----------------------------------------------------------
+  // Resolve provider + config, account-scoped.
+  //
+  // Meta config is checked first (unchanged behaviour for every
+  // existing Meta account). If there's no whatsapp_config row, we
+  // fall back to a connected gupshup_config row. If neither exists,
+  // this is the same "not configured" error as before.
+  // ----------------------------------------------------------
+
+  const { data: metaConfig, error: metaConfigError } = await db
     .from('whatsapp_config')
     .select('*')
     .eq('account_id', accountId)
-    .single();
+    .maybeSingle();
 
-  if (configError || !config) {
-    throw new SendMessageError(
-      'whatsapp_not_configured',
-      'WhatsApp not configured. Please set up your WhatsApp integration first.',
-      400
+  if (metaConfigError) {
+    console.error(
+      '[send-message] whatsapp_config query error:',
+      metaConfigError.message
     );
   }
+
+  if (!metaConfig) {
+    const { data: gupshupConfig, error: gupshupConfigError } = await db
+      .from('gupshup_config')
+      .select('*')
+      .eq('account_id', accountId)
+      .eq('status', 'connected')
+      .maybeSingle();
+
+    if (gupshupConfigError) {
+      console.error(
+        '[send-message] gupshup_config query error:',
+        gupshupConfigError.message
+      );
+    }
+
+    if (!gupshupConfig) {
+      throw new SendMessageError(
+        'whatsapp_not_configured',
+        'WhatsApp not configured. Please set up your WhatsApp integration first.',
+        400
+      );
+    }
+
+    // --------------------------------------------------------
+    // Gupshup path — text only for now.
+    // --------------------------------------------------------
+
+    if (messageType !== 'text') {
+      throw new SendMessageError(
+        'unsupported_for_gupshup',
+        `Message type "${messageType}" is not supported for Gupshup yet — only text messages are supported right now.`,
+        400
+      );
+    }
+
+    let waMessageId: string;
+    try {
+      const result = await sendGupshupTextMessage({
+        apiKey: gupshupConfig.api_key,
+        source: gupshupConfig.source_number,
+        appName: gupshupConfig.app_name,
+        to: sanitizedPhone,
+        text: contentText!,
+      });
+      waMessageId = result.messageId;
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Unknown Gupshup API error';
+      console.error('[send-message] Gupshup send failed:', message);
+      throw new SendMessageError('gupshup_error', message, 502);
+    }
+
+    const { data: messageRecord, error: msgError } = await db
+      .from('messages')
+      .insert({
+        conversation_id: conversationId,
+        sender_type: 'agent',
+        content_type: 'text',
+        content_text: contentText ?? null,
+        message_id: waMessageId,
+        status: 'sent',
+        reply_to_message_id: replyToMessageId || null,
+      })
+      .select()
+      .single();
+
+    if (msgError) {
+      console.error('[send-message] error inserting sent message:', msgError);
+      throw new SendMessageError(
+        'db_error',
+        `Message sent to Gupshup but failed to save to DB: ${msgError.message}`,
+        500
+      );
+    }
+
+    await db
+      .from('conversations')
+      .update({
+        last_message_text: contentText || '[text]',
+        last_message_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', conversationId);
+
+    // Pause any active Flow run for this contact — same signal as the
+    // Meta path below.
+    try {
+      const { error: pauseErr } = await supabaseAdmin()
+        .from('flow_runs')
+        .update({
+          status: 'paused_by_agent',
+          ended_at: new Date().toISOString(),
+          end_reason: 'agent_replied',
+        })
+        .eq('account_id', accountId)
+        .eq('contact_id', contact.id)
+        .eq('status', 'active');
+      if (pauseErr) {
+        console.error('[flows] pause-on-agent-send failed:', pauseErr.message);
+      }
+    } catch (err) {
+      console.error(
+        '[flows] pause-on-agent-send threw:',
+        err instanceof Error ? err.message : err
+      );
+    }
+
+    return { messageId: messageRecord.id, whatsappMessageId: waMessageId };
+  }
+
+  // ----------------------------------------------------------
+  // Meta path — unchanged from the original implementation.
+  // ----------------------------------------------------------
+
+  const config = metaConfig;
 
   const accessToken = decrypt(config.access_token);
 
