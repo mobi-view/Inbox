@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { requireRole, toErrorResponse } from '@/lib/auth/account'
 import { sendTemplateMessage } from '@/lib/whatsapp/meta-api'
+import { sendGupshupTemplateMessage } from '@/lib/whatsapp/gupshup-api'
 import { decrypt } from '@/lib/whatsapp/encryption'
 import type { SendTimeParams } from '@/lib/whatsapp/template-send-builder'
 import { isMessageTemplate } from '@/lib/whatsapp/template-row-guard'
@@ -120,13 +121,43 @@ export async function POST(request: Request) {
       )
     }
 
-    const { data: config, error: configError } = await supabase
+    // ----------------------------------------------------------
+    // Resolve provider + config, account-scoped. Same fallback order
+    // as sendMessageToConversation: Meta config wins if present,
+    // otherwise fall back to a connected Gupshup config. Keeps every
+    // existing Meta broadcaster's behaviour unchanged.
+    // ----------------------------------------------------------
+    const { data: metaConfig, error: metaConfigError } = await supabase
       .from('whatsapp_config')
       .select('*')
       .eq('account_id', accountId)
-      .single()
+      .maybeSingle()
 
-    if (configError || !config) {
+    if (metaConfigError) {
+      console.error('[broadcast] whatsapp_config query error:', metaConfigError.message)
+    }
+
+    let gupshupConfig: {
+      api_key: string
+      source_number: string
+      app_name: string
+    } | null = null
+
+    if (!metaConfig) {
+      const { data, error: gupshupConfigError } = await supabase
+        .from('gupshup_config')
+        .select('*')
+        .eq('account_id', accountId)
+        .eq('status', 'connected')
+        .maybeSingle()
+
+      if (gupshupConfigError) {
+        console.error('[broadcast] gupshup_config query error:', gupshupConfigError.message)
+      }
+      gupshupConfig = data
+    }
+
+    if (!metaConfig && !gupshupConfig) {
       return NextResponse.json(
         {
           error:
@@ -136,13 +167,12 @@ export async function POST(request: Request) {
       )
     }
 
-    const accessToken = decrypt(config.access_token)
-
-    // Load the template row once so sendTemplateMessage can build
-    // header + button components on each iteration. Loading inside
-    // the loop would N+1 against Supabase for every recipient.
-    // Guard against a malformed local row crashing every send in
-    // the loop with the same opaque TypeError — fail loudly once.
+    // Load the template row once so sendTemplateMessage (Meta) can
+    // build header + button components, and so the Gupshup path can
+    // resolve gupshup_template_id. Loading inside the loop would
+    // N+1 against Supabase for every recipient. Guard against a
+    // malformed local row crashing every send in the loop with the
+    // same opaque TypeError — fail loudly once.
     const { data: rawTemplateRow } = await supabase
       .from('message_templates')
       .select('*')
@@ -165,70 +195,133 @@ export async function POST(request: Request) {
     let sentCount = 0
     let failedCount = 0
 
-    for (const recipient of recipients) {
-      const sanitized = sanitizePhoneForMeta(recipient.phone)
+    if (gupshupConfig) {
+      // ----------------------------------------------------------
+      // Gupshup broadcast path.
+      // ----------------------------------------------------------
+      const gupshupTemplateId = (templateRow as { gupshup_template_id?: string } | null)
+        ?.gupshup_template_id
 
-      if (!isValidE164(sanitized)) {
-        results.push({
-          phone: recipient.phone,
-          status: 'failed',
-          error: 'Invalid phone number format',
-        })
-        failedCount++
-        continue
+      if (!gupshupTemplateId) {
+        return NextResponse.json(
+          {
+            error: `Template "${template_name}" has no gupshup_template_id set. Open Settings → Templates and paste in the matching Gupshup template UUID from the Gupshup Dashboard before broadcasting.`,
+          },
+          { status: 400 },
+        )
       }
 
-      // Retry with phone variants on "not in allowed list" so numbers
-      // that differ only in a trunk-prefix 0 still reach recipients.
-      const variants = phoneVariants(sanitized)
-      let sentMessageId: string | null = null
-      let lastError: string | null = null
+      for (const recipient of recipients) {
+        const sanitized = sanitizePhoneForMeta(recipient.phone)
 
-      for (const variant of variants) {
+        if (!isValidE164(sanitized)) {
+          results.push({
+            phone: recipient.phone,
+            status: 'failed',
+            error: 'Invalid phone number format',
+          })
+          failedCount++
+          continue
+        }
+
         try {
-          const result = await sendTemplateMessage({
-            phoneNumberId: config.phone_number_id,
-            accessToken,
-            to: variant,
-            templateName: template_name,
-            language: template_language || 'en_US',
-            template: templateRow ?? undefined,
-            messageParams: recipient.messageParams,
+          const result = await sendGupshupTemplateMessage({
+            apiKey: gupshupConfig.api_key,
+            source: gupshupConfig.source_number,
+            appName: gupshupConfig.app_name,
+            to: sanitized,
+            gupshupTemplateId,
             params: recipient.params ?? [],
           })
-          sentMessageId = result.messageId
-          lastError = null
-          break
+          results.push({
+            phone: recipient.phone,
+            status: 'sent',
+            whatsapp_message_id: result.messageId,
+          })
+          sentCount++
         } catch (error) {
           const errorMessage =
-            error instanceof Error ? error.message : 'Unknown error'
-          if (!isRecipientNotAllowedError(errorMessage)) {
-            lastError = errorMessage
-            break
-          }
-          lastError = errorMessage
-          // retry with next variant
+            error instanceof Error ? error.message : 'Unknown Gupshup error'
+          console.error(`Failed to send broadcast to ${recipient.phone}:`, errorMessage)
+          results.push({
+            phone: recipient.phone,
+            status: 'failed',
+            error: errorMessage,
+          })
+          failedCount++
         }
       }
+    } else {
+      // ----------------------------------------------------------
+      // Meta broadcast path — unchanged from the original implementation.
+      // ----------------------------------------------------------
+      const accessToken = decrypt(metaConfig!.access_token)
 
-      if (sentMessageId) {
-        results.push({
-          phone: recipient.phone,
-          status: 'sent',
-          whatsapp_message_id: sentMessageId,
-        })
-        sentCount++
-      } else {
-        console.error(
-          `Failed to send broadcast to ${recipient.phone}:`,
-          lastError
-        )
-        results.push({
-          phone: recipient.phone,
-          status: 'failed',
-          error: lastError || 'Unknown error',
-        })
-        failedCount++
+      for (const recipient of recipients) {
+        const sanitized = sanitizePhoneForMeta(recipient.phone)
+
+        if (!isValidE164(sanitized)) {
+          results.push({
+            phone: recipient.phone,
+            status: 'failed',
+            error: 'Invalid phone number format',
+          })
+          failedCount++
+          continue
+        }
+
+        // Retry with phone variants on "not in allowed list" so numbers
+        // that differ only in a trunk-prefix 0 still reach recipients.
+        const variants = phoneVariants(sanitized)
+        let sentMessageId: string | null = null
+        let lastError: string | null = null
+
+        for (const variant of variants) {
+          try {
+            const result = await sendTemplateMessage({
+              phoneNumberId: metaConfig!.phone_number_id,
+              accessToken,
+              to: variant,
+              templateName: template_name,
+              language: template_language || 'en_US',
+              template: templateRow ?? undefined,
+              messageParams: recipient.messageParams,
+              params: recipient.params ?? [],
+            })
+            sentMessageId = result.messageId
+            lastError = null
+            break
+          } catch (error) {
+            const errorMessage =
+              error instanceof Error ? error.message : 'Unknown error'
+            if (!isRecipientNotAllowedError(errorMessage)) {
+              lastError = errorMessage
+              break
+            }
+            lastError = errorMessage
+            // retry with next variant
+          }
+        }
+
+        if (sentMessageId) {
+          results.push({
+            phone: recipient.phone,
+            status: 'sent',
+            whatsapp_message_id: sentMessageId,
+          })
+          sentCount++
+        } else {
+          console.error(
+            `Failed to send broadcast to ${recipient.phone}:`,
+            lastError
+          )
+          results.push({
+            phone: recipient.phone,
+            status: 'failed',
+            error: lastError || 'Unknown error',
+          })
+          failedCount++
+        }
       }
     }
 
