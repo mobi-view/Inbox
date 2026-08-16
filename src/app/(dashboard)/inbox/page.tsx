@@ -200,13 +200,27 @@ function InboxPageInner() {
         return;
       }
 
-      const { data } = await supabase
+      const { data: metaConfig } = await supabase
         .from("whatsapp_config")
         .select("status")
         .eq("account_id", accountId)
         .maybeSingle();
 
-      setWhatsappConnected(data?.status === "connected");
+      if (metaConfig?.status === "connected") {
+        setWhatsappConnected(true);
+        return;
+      }
+
+      // No Meta config (or not connected) — fall back to Gupshup,
+      // same provider-resolution order used by sendMessageToConversation.
+      const { data: gupshupConfig } = await supabase
+        .from("gupshup_config")
+        .select("status")
+        .eq("account_id", accountId)
+        .eq("status", "connected")
+        .maybeSingle();
+
+      setWhatsappConnected(!!gupshupConfig);
     };
 
     checkConnection();

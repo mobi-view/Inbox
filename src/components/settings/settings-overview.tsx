@@ -120,18 +120,29 @@ export function SettingsOverview({
     // WhatsApp connection status — slower, independent.
     (async () => {
       setWhatsappLoading(true);
-      const [row, health] = await Promise.allSettled([
+      const [row, gupshupRow, health] = await Promise.allSettled([
         supabase
           .from('whatsapp_config')
           .select('phone_number_id')
           .eq('account_id', acctId)
           .maybeSingle(),
+        supabase
+          .from('gupshup_config')
+          .select('status')
+          .eq('account_id', acctId)
+          .eq('status', 'connected')
+          .maybeSingle(),
         fetch('/api/whatsapp/config', { cache: 'no-store' }).then((r) => r.json()),
       ]);
       if (cancelled) return;
+      const hasMeta = row.status === 'fulfilled' && !!row.value.data?.phone_number_id;
+      const hasGupshup =
+        gupshupRow.status === 'fulfilled' && !!gupshupRow.value.data;
       setWhatsapp({
-        configured: row.status === 'fulfilled' && !!row.value.data?.phone_number_id,
-        connected: health.status === 'fulfilled' && !!health.value?.connected,
+        configured: hasMeta || hasGupshup,
+        connected:
+          (health.status === 'fulfilled' && !!health.value?.connected) ||
+          hasGupshup,
       });
       setWhatsappLoading(false);
     })();
