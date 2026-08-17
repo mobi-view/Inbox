@@ -211,6 +211,21 @@ export async function POST(request: Request) {
         )
       }
 
+      let decryptedApiKey: string
+      try {
+        decryptedApiKey = decrypt(gupshupConfig.api_key)
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Unknown decryption error'
+        console.error('[broadcast] Gupshup api_key decryption failed:', message)
+        return NextResponse.json(
+          {
+            error:
+              'The stored Gupshup API key cannot be decrypted with the current ENCRYPTION_KEY. Reconnect Gupshup in Settings.',
+          },
+          { status: 500 },
+        )
+      }
+
       for (const recipient of recipients) {
         const sanitized = sanitizePhoneForMeta(recipient.phone)
 
@@ -226,11 +241,11 @@ export async function POST(request: Request) {
 
         try {
           const result = await sendGupshupTemplateMessage({
-            apiKey: gupshupConfig.api_key,
+            apiKey: decryptedApiKey,
             source: gupshupConfig.source_number,
             appName: gupshupConfig.app_name,
             to: sanitized,
-            gupshupTemplateId,
+            templateId: gupshupTemplateId,
             params: recipient.params ?? [],
           })
           results.push({
