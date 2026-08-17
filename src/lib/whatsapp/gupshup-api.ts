@@ -24,12 +24,39 @@ export interface SendGupshupResult {
   messageId: string;
 }
 
-export async function sendGupshupTextMessage(
-  params: SendGupshupTextParams
-): Promise<SendGupshupResult> {
-  const { apiKey, source, appName, to, text } = params;
 
-  const response = await fetch('https://api.gupshup.io/wa/api/v1/msg', {
+// ============================================================
+// Template send — Gupshup's template API is structurally different
+// from its plain-text endpoint: it identifies the template by its
+// Gupshup-assigned template ID (not name + language, like Meta), and
+// takes a flat array of positional parameters rather than a
+// name/language pair. The template ID is what message_templates.
+// gupshup_template_id stores once a template is created/approved in
+// the Gupshup dashboard.
+//
+// Docs: https://docs.gupshup.io/docs/template-messages
+// ============================================================
+
+export interface SendGupshupTemplateParams {
+  apiKey: string;
+  /** Your Gupshup source number (the WhatsApp number messages are sent from). */
+  source: string;
+  /** Your Gupshup app name, sent as src.name. */
+  appName: string;
+  /** Destination phone number, digits only (no leading +). */
+  to: string;
+  /** Gupshup's template ID (from message_templates.gupshup_template_id), not the template name. */
+  templateId: string;
+  /** Positional body variables, in order — e.g. ["Jane", "#1234"]. */
+  params?: string[];
+}
+
+export async function sendGupshupTemplateMessage(
+  params: SendGupshupTemplateParams
+): Promise<SendGupshupResult> {
+  const { apiKey, source, appName, to, templateId, params: templateParams } = params;
+
+  const response = await fetch('https://api.gupshup.io/wa/api/v1/template/msg', {
     method: 'POST',
     headers: {
       apikey: apiKey,
@@ -40,16 +67,19 @@ export async function sendGupshupTextMessage(
       source,
       destination: to,
       'src.name': appName,
-      message: JSON.stringify({ type: 'text', text }),
+      template: JSON.stringify({
+        id: templateId,
+        params: templateParams ?? [],
+      }),
     }),
   });
 
   const responseText = await response.text();
 
-  console.log('[Gupshup SEND]', response.status, responseText);
+  console.log('[Gupshup TEMPLATE SEND]', response.status, responseText);
 
   if (!response.ok) {
-    throw new Error(`Gupshup rejected the message: ${responseText}`);
+    throw new Error(`Gupshup rejected the template message: ${responseText}`);
   }
 
   let result: Record<string, unknown>;
