@@ -230,7 +230,7 @@ export async function POST(request: Request) {
             source: gupshupConfig.source_number,
             appName: gupshupConfig.app_name,
             to: sanitized,
-            gupshupTemplateId,
+            templateId: gupshupTemplateId,
             params: recipient.params ?? [],
           })
           results.push({
