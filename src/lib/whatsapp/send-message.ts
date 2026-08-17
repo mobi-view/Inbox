@@ -35,10 +35,7 @@ import {
   sendInteractiveList,
   type MediaKind,
 } from '@/lib/whatsapp/meta-api';
-import {
-  sendGupshupTextMessage,
-  sendGupshupTemplateMessage,
-} from '@/lib/whatsapp/gupshup-api';
+import { sendGupshupTextMessage } from '@/lib/whatsapp/gupshup-api';
 import {
   validateInteractivePayload,
   interactivePayloadPreviewText,
@@ -296,64 +293,43 @@ export async function sendMessageToConversation(
     }
 
     // --------------------------------------------------------
-    // Gupshup path — text and template (media/interactive still
-    // unsupported; Gupshup shapes those differently and aren't
-    // wired up).
+    // Gupshup path — text only for now.
     // --------------------------------------------------------
 
-    if (messageType !== 'text' && messageType !== 'template') {
+    if (messageType !== 'text') {
       throw new SendMessageError(
         'unsupported_for_gupshup',
-        `Message type "${messageType}" is not supported for Gupshup yet — only text and template messages are supported right now.`,
+        `Message type "${messageType}" is not supported for Gupshup yet — only text messages are supported right now.`,
         400
+      );
+    }
+
+    let gupshupApiKey: string;
+    try {
+      gupshupApiKey = decrypt(gupshupConfig.api_key);
+    } catch (err) {
+      console.error(
+        '[send-message] Gupshup api_key decryption failed:',
+        err
+      );
+      throw new SendMessageError(
+        'gupshup_token_corrupted',
+        'The stored Gupshup API key cannot be decrypted with the current ENCRYPTION_KEY. Reconnect Gupshup in Settings.',
+        500
       );
     }
 
     let waMessageId: string;
     try {
-      if (messageType === 'template') {
-        const { data: gsTemplateRow, error: gsTemplateError } = await db
-          .from('message_templates')
-          .select('gupshup_template_id')
-          .eq('account_id', accountId)
-          .eq('name', templateName!)
-          .eq('language', templateLanguage || 'en_US')
-          .maybeSingle();
-
-        if (gsTemplateError) {
-          throw new Error(
-            `Failed to look up template: ${gsTemplateError.message}`
-          );
-        }
-        if (!gsTemplateRow?.gupshup_template_id) {
-          throw new SendMessageError(
-            'gupshup_template_not_mapped',
-            `Template "${templateName}" has no gupshup_template_id set. Open Settings → Templates and paste in the matching Gupshup template UUID from the Gupshup Dashboard before sending.`,
-            400
-          );
-        }
-
-        const result = await sendGupshupTemplateMessage({
-          apiKey: gupshupConfig.api_key,
-          source: gupshupConfig.source_number,
-          appName: gupshupConfig.app_name,
-          to: sanitizedPhone,
-          gupshupTemplateId: gsTemplateRow.gupshup_template_id,
-          params: templateParams || [],
-        });
-        waMessageId = result.messageId;
-      } else {
-        const result = await sendGupshupTextMessage({
-          apiKey: gupshupConfig.api_key,
-          source: gupshupConfig.source_number,
-          appName: gupshupConfig.app_name,
-          to: sanitizedPhone,
-          text: contentText!,
-        });
-        waMessageId = result.messageId;
-      }
+      const result = await sendGupshupTextMessage({
+        apiKey: gupshupApiKey,
+        source: gupshupConfig.source_number,
+        appName: gupshupConfig.app_name,
+        to: sanitizedPhone,
+        text: contentText!,
+      });
+      waMessageId = result.messageId;
     } catch (err) {
-      if (err instanceof SendMessageError) throw err;
       const message =
         err instanceof Error ? err.message : 'Unknown Gupshup API error';
       console.error('[send-message] Gupshup send failed:', message);
@@ -365,9 +341,8 @@ export async function sendMessageToConversation(
       .insert({
         conversation_id: conversationId,
         sender_type: 'agent',
-        content_type: messageType,
+        content_type: 'text',
         content_text: contentText ?? null,
-        template_name: messageType === 'template' ? templateName : null,
         message_id: waMessageId,
         status: 'sent',
         reply_to_message_id: replyToMessageId || null,
@@ -387,8 +362,7 @@ export async function sendMessageToConversation(
     await db
       .from('conversations')
       .update({
-        last_message_text:
-          contentText || (messageType === 'template' ? `[template: ${templateName}]` : '[text]'),
+        last_message_text: contentText || '[text]',
         last_message_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       })
