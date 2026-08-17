@@ -24,6 +24,51 @@ export interface SendGupshupResult {
   messageId: string;
 }
 
+export async function sendGupshupTextMessage(
+  params: SendGupshupTextParams
+): Promise<SendGupshupResult> {
+  const { apiKey, source, appName, to, text } = params;
+
+  const response = await fetch('https://api.gupshup.io/wa/api/v1/msg', {
+    method: 'POST',
+    headers: {
+      apikey: apiKey,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: new URLSearchParams({
+      channel: 'whatsapp',
+      source,
+      destination: to,
+      'src.name': appName,
+      message: JSON.stringify({ type: 'text', text }),
+    }),
+  });
+
+  const responseText = await response.text();
+
+  console.log('[Gupshup SEND]', response.status, responseText);
+
+  if (!response.ok) {
+    throw new Error(`Gupshup rejected the message: ${responseText}`);
+  }
+
+  let result: Record<string, unknown>;
+  try {
+    result = JSON.parse(responseText);
+  } catch {
+    result = { raw: responseText };
+  }
+
+  const messageId =
+    (result?.messageId as string | undefined) ||
+    (result?.message_id as string | undefined);
+
+  if (!messageId) {
+    throw new Error(`Gupshup response missing messageId: ${responseText}`);
+  }
+
+  return { messageId };
+}
 
 // ============================================================
 // Template send — Gupshup's template API is structurally different
