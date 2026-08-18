@@ -134,6 +134,7 @@ export function TemplateManager() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [syncingGupshup, setSyncingGupshup] = useState(false);
   const [form, setForm] = useState<TemplateFormData>(emptyForm);
   // Non-null when the dialog is editing an existing row — switches the
   // submit handler from POST /submit to PATCH /[id] and changes the
@@ -343,6 +344,40 @@ export function TemplateManager() {
     }
   }
 
+  async function handleSyncFromGupshup() {
+    if (!user) return;
+    setSyncingGupshup(true);
+    try {
+      const res = await fetch('/api/gupshup/templates/sync', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.error || `Sync failed (HTTP ${res.status})`);
+      }
+      toast.success(
+        t('toastSyncCount', { total: data.total }) +
+          (data.inserted || data.updated
+            ? t('toastSyncDetails', { inserted: data.inserted, updated: data.updated })
+            : ''),
+      );
+      if (Array.isArray(data.errors) && data.errors.length > 0) {
+        const preview = data.errors.slice(0, 3).map(
+          (e: { name: string; language: string; message: string }) =>
+            `${e.name} (${e.language})`,
+        );
+        const suffix =
+          data.errors.length > 3 ? `, +${data.errors.length - 3} more` : '';
+        toast.error(t('toastSyncFailed', { preview: preview.join(', ') + suffix }));
+      }
+      await fetchTemplates(user.id);
+    } catch (err) {
+      console.error('Gupshup template sync error:', err);
+      toast.error(err instanceof Error ? err.message : t('toastSyncError'));
+    } finally {
+      setSyncingGupshup(false);
+    }
+  }
+
+
   async function confirmDelete() {
     const target = templateToDelete;
     if (!target || deletingId) return;
@@ -496,6 +531,15 @@ export function TemplateManager() {
             >
               <RefreshCw className={`size-4 ${syncing ? 'animate-spin' : ''}`} />
               {syncing ? t('syncing') : t('syncFromMeta')}
+            </Button>
+            <Button
+              variant="outline"
+              onClick={handleSyncFromGupshup}
+              disabled={syncingGupshup}
+              title={t('syncGupshupTitle')}
+            >
+              <RefreshCw className={`size-4 ${syncingGupshup ? 'animate-spin' : ''}`} />
+              {syncingGupshup ? t('syncingGupshup') : t('syncFromGupshup')}
             </Button>
             <Button onClick={openCreate}>
               <Plus className="size-4" />
