@@ -211,6 +211,25 @@ export async function POST(request: Request) {
         )
       }
 
+      const headerType = (templateRow as { header_type?: string } | null)?.header_type
+      const headerMediaUrl = (templateRow as { header_media_url?: string } | null)
+        ?.header_media_url
+      const needsHeaderMedia =
+        headerType === 'image' || headerType === 'video' || headerType === 'document'
+
+      if (needsHeaderMedia && !headerMediaUrl) {
+        return NextResponse.json(
+          {
+            error: `Template "${template_name}" has a ${headerType} header but no header_media_url set. Open Settings → Templates and add the header media URL before broadcasting.`,
+          },
+          { status: 400 },
+        )
+      }
+
+      const gupshupHeader = needsHeaderMedia
+        ? { type: headerType as 'image' | 'video' | 'document', link: headerMediaUrl! }
+        : undefined
+
       let decryptedApiKey: string
       try {
         decryptedApiKey = decrypt(gupshupConfig.api_key)
@@ -247,6 +266,7 @@ export async function POST(request: Request) {
             to: sanitized,
             templateId: gupshupTemplateId,
             params: recipient.params ?? [],
+            header: gupshupHeader,
           })
           results.push({
             phone: recipient.phone,

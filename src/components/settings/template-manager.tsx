@@ -359,6 +359,9 @@ export function TemplateManager() {
             ? t('toastSyncDetails', { inserted: data.inserted, updated: data.updated })
             : ''),
       );
+      if (data.needsHeaderMedia > 0) {
+        toast.warning(t('toastSyncNeedsHeaderMedia', { count: data.needsHeaderMedia }));
+      }
       if (Array.isArray(data.errors) && data.errors.length > 0) {
         const preview = data.errors.slice(0, 3).map(
           (e: { name: string; language: string; message: string }) =>

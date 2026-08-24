@@ -328,7 +328,7 @@ export async function sendMessageToConversation(
       if (messageType === 'template') {
         const { data: gsTemplateRow, error: gsTemplateError } = await db
           .from('message_templates')
-          .select('gupshup_template_id')
+          .select('gupshup_template_id, header_type, header_media_url')
           .eq('account_id', accountId)
           .eq('name', templateName!)
           .eq('language', templateLanguage || 'en_US')
@@ -347,6 +347,17 @@ export async function sendMessageToConversation(
           );
         }
 
+        const headerType = gsTemplateRow.header_type;
+        const needsHeaderMedia =
+          headerType === 'image' || headerType === 'video' || headerType === 'document';
+        if (needsHeaderMedia && !gsTemplateRow.header_media_url) {
+          throw new SendMessageError(
+            'gupshup_template_header_media_missing',
+            `Template "${templateName}" has a ${headerType} header but no header_media_url set. Open Settings → Templates and add the header media URL before sending.`,
+            400
+          );
+        }
+
         const result = await sendGupshupTemplateMessage({
           apiKey: gupshupApiKey,
           source: gupshupConfig.source_number,
@@ -354,6 +365,12 @@ export async function sendMessageToConversation(
           to: sanitizedPhone,
           templateId: gsTemplateRow.gupshup_template_id,
           params: templateParams || [],
+          header: needsHeaderMedia
+            ? {
+                type: headerType as 'image' | 'video' | 'document',
+                link: gsTemplateRow.header_media_url!,
+              }
+            : undefined,
         });
         waMessageId = result.messageId;
       } else {

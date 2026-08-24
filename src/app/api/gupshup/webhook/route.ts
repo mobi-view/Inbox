@@ -75,6 +75,19 @@ export async function POST(request: NextRequest) {
 
     const text = messageType === "text" ? payload?.payload?.text || "" : "";
 
+    // Media messages (image/video/audio/document/sticker) carry their
+    // content at payload.payload.url + payload.payload.caption — a
+    // Gupshup FileManager URL with a short expiry window (see
+    // payload.payload.urlExpiry), not the plain text field above.
+    // Without this, media messages showed up with no image/attachment
+    // at all — content_type was set correctly but media_url was never
+    // populated.
+    const isMediaType = ["image", "video", "audio", "document", "sticker"].includes(
+      messageType
+    );
+    const mediaUrl = isMediaType ? payload?.payload?.url || null : null;
+    const mediaCaption = isMediaType ? payload?.payload?.caption || null : null;
+
     if (!messageId) {
       console.error("Missing message ID");
 
@@ -440,7 +453,8 @@ export async function POST(request: NextRequest) {
         conversation_id: conversation.id,
         sender_type: "customer",
         content_type: contentType,
-        content_text: text || null,
+        content_text: text || mediaCaption || null,
+        media_url: mediaUrl,
         message_id: messageId,
         status: "delivered",
         created_at: createdAt,

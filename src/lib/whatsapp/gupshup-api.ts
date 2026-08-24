@@ -94,12 +94,48 @@ export interface SendGupshupTemplateParams {
   templateId: string;
   /** Positional body variables, in order — e.g. ["Jane", "#1234"]. */
   params?: string[];
+  /**
+   * Header media, for templates whose header is image/video/document.
+   * Gupshup needs this as a *separate* top-level `message` field
+   * alongside `template` — sending only `template` (id + body params)
+   * silently drops the header image/video/document with no error.
+   */
+  header?: {
+    type: 'image' | 'video' | 'document';
+    /** Public URL of the media to show in the header. */
+    link: string;
+    /** Required by Gupshup for document headers; ignored otherwise. */
+    filename?: string;
+  };
 }
 
 export async function sendGupshupTemplateMessage(
   params: SendGupshupTemplateParams
 ): Promise<SendGupshupResult> {
-  const { apiKey, source, appName, to, templateId, params: templateParams } = params;
+  const { apiKey, source, appName, to, templateId, params: templateParams, header } = params;
+
+  const body: Record<string, string> = {
+    channel: 'whatsapp',
+    source,
+    destination: to,
+    'src.name': appName,
+    template: JSON.stringify({
+      id: templateId,
+      params: templateParams ?? [],
+    }),
+  };
+
+  if (header) {
+    body.message = JSON.stringify({
+      type: header.type,
+      [header.type]: {
+        link: header.link,
+        ...(header.type === 'document' && header.filename
+          ? { filename: header.filename }
+          : {}),
+      },
+    });
+  }
 
   const response = await fetch('https://api.gupshup.io/wa/api/v1/template/msg', {
     method: 'POST',
@@ -107,16 +143,7 @@ export async function sendGupshupTemplateMessage(
       apikey: apiKey,
       'Content-Type': 'application/x-www-form-urlencoded',
     },
-    body: new URLSearchParams({
-      channel: 'whatsapp',
-      source,
-      destination: to,
-      'src.name': appName,
-      template: JSON.stringify({
-        id: templateId,
-        params: templateParams ?? [],
-      }),
-    }),
+    body: new URLSearchParams(body),
   });
 
   const responseText = await response.text();
