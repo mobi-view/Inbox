@@ -314,6 +314,9 @@
       "selectedCount": "{count} selected",
       "clearSelection": "Clear",
       "deleteSelected": "Delete selected",
+      "addToGroup": "Add to group",
+      "toastBulkGroupAdded": "Added {count} contacts to \"{name}\"",
+      "toastBulkGroupFailed": "Failed to add {count} contacts",
       "tableColumns": {
         "name": "Name",
         "phone": "Phone",

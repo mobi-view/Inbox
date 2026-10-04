@@ -13,7 +13,9 @@ import {
   ArrowRight,
   ArrowLeft,
   X,
+  ChevronDown,
 } from 'lucide-react';
+import { Checkbox } from '@/components/ui/checkbox';
 import { useTranslations } from 'next-intl';
 
 type AudienceType = 'all' | 'tags' | 'custom_field' | 'csv';
@@ -31,6 +33,8 @@ interface AudienceConfig {
   customField?: CustomFieldFilter;
   csvContacts?: { phone: string; name?: string }[];
   excludeTagIds?: string[];
+  /** Contacts the user unticked inside the chosen tag(s). */
+  excludeContactIds?: string[];
 }
 
 interface Step2Props {
@@ -92,6 +96,15 @@ export function Step2SelectAudience({
   const [estimatedCount, setEstimatedCount] = useState<number | null>(null);
   const [loadingCount, setLoadingCount] = useState(false);
 
+  // Members of the selected tag(s), shown in an expandable list so the
+  // user can untick individual contacts instead of sending to the whole group.
+  const [showMembers, setShowMembers] = useState(false);
+  const [members, setMembers] = useState<
+    { id: string; name: string | null; phone: string }[]
+  >([]);
+  const [loadingMembers, setLoadingMembers] = useState(false);
+  const [memberSearch, setMemberSearch] = useState('');
+
   // Tags are used both by the primary "Filter by Tags" audience type
   // AND by the exclude-list below — so always load once on mount.
   useEffect(() => {
@@ -126,6 +139,43 @@ export function Step2SelectAudience({
     }
     fetchFields();
   }, [audience.type]);
+
+  const tagIdsKey = (audience.tagIds ?? []).join(',');
+  useEffect(() => {
+    if (audience.type !== 'tags' || !showMembers || !tagIdsKey) {
+      setMembers([]);
+      return;
+    }
+    let cancelled = false;
+    async function fetchMembers() {
+      setLoadingMembers(true);
+      try {
+        const supabase = createClient();
+        const { data: rows } = await supabase
+          .from('contact_tags')
+          .select('contact_id')
+          .in('tag_id', tagIdsKey.split(','));
+        const ids = [...new Set((rows ?? []).map((r) => r.contact_id))];
+        const out: { id: string; name: string | null; phone: string }[] = [];
+        const PAGE = 500;
+        for (let i = 0; i < ids.length; i += PAGE) {
+          const { data } = await supabase
+            .from('contacts')
+            .select('id, name, phone')
+            .in('id', ids.slice(i, i + PAGE));
+          out.push(...(data ?? []));
+        }
+        out.sort((a, b) => (a.name || a.phone).localeCompare(b.name || b.phone));
+        if (!cancelled) setMembers(out);
+      } finally {
+        if (!cancelled) setLoadingMembers(false);
+      }
+    }
+    fetchMembers();
+    return () => {
+      cancelled = true;
+    };
+  }, [audience.type, showMembers, tagIdsKey]);
 
   const fetchEstimatedCount = useCallback(async () => {
     setLoadingCount(true);
@@ -186,8 +236,9 @@ export function Step2SelectAudience({
       }
 
       if (baseIds) {
+        const skipContacts = new Set(audience.excludeContactIds ?? []);
         const effective = [...baseIds].filter(
-          (id) => !excludeSet?.has(id),
+          (id) => !excludeSet?.has(id) && !skipContacts.has(id),
         );
         setEstimatedCount(effective.length);
       } else {
@@ -207,6 +258,7 @@ export function Step2SelectAudience({
     audience.customField,
     audience.csvContacts,
     audience.excludeTagIds,
+    audience.excludeContactIds,
   ]);
 
   useEffect(() => {
@@ -218,7 +270,22 @@ export function Step2SelectAudience({
     const updated = current.includes(tagId)
       ? current.filter((id) => id !== tagId)
       : [...current, tagId];
-    onUpdate({ ...audience, tagIds: updated });
+    onUpdate({ ...audience, tagIds: updated, excludeContactIds: [] });
+  }
+
+  function toggleMember(contactId: string) {
+    const current = audience.excludeContactIds ?? [];
+    const updated = current.includes(contactId)
+      ? current.filter((id) => id !== contactId)
+      : [...current, contactId];
+    onUpdate({ ...audience, excludeContactIds: updated });
+  }
+
+  function setAllMembers(selectAll: boolean) {
+    onUpdate({
+      ...audience,
+      excludeContactIds: selectAll ? [] : members.map((m) => m.id),
+    });
   }
 
   function toggleExcludeTag(tagId: string) {
@@ -271,6 +338,8 @@ export function Step2SelectAudience({
                   // Wipe shape fields from other types to avoid stale
                   // config leaking across selections.
                   tagIds: option.type === 'tags' ? audience.tagIds : undefined,
+                  excludeContactIds:
+                    option.type === 'tags' ? audience.excludeContactIds : undefined,
                   customField:
                     option.type === 'custom_field'
                       ? audience.customField
@@ -336,6 +405,85 @@ export function Step2SelectAudience({
                   </button>
                 );
               })}
+            </div>
+          )}
+
+          {(audience.tagIds?.length ?? 0) > 0 && (
+            <div className="mt-4 border-t border-border pt-3">
+              <button
+                type="button"
+                onClick={() => setShowMembers((v) => !v)}
+                className="flex items-center gap-1.5 text-xs font-medium text-primary hover:underline"
+              >
+                <ChevronDown
+                  className={`h-3.5 w-3.5 transition-transform ${showMembers ? 'rotate-180' : ''}`}
+                />
+                Choose individual contacts
+                {(audience.excludeContactIds?.length ?? 0) > 0 &&
+                  ` (${audience.excludeContactIds!.length} left out)`}
+              </button>
+
+              {showMembers && (
+                <div className="mt-3 space-y-2">
+                  {loadingMembers ? (
+                    <Loader2 className="h-4 w-4 animate-spin text-primary" />
+                  ) : (
+                    <>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="text"
+                          value={memberSearch}
+                          onChange={(e) => setMemberSearch(e.target.value)}
+                          placeholder="Search contacts…"
+                          className="h-8 flex-1 rounded-lg border border-border bg-muted px-2.5 text-xs text-foreground outline-none placeholder:text-muted-foreground focus:border-primary"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setAllMembers(true)}
+                          className="text-xs text-primary hover:underline"
+                        >
+                          Select all
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setAllMembers(false)}
+                          className="text-xs text-muted-foreground hover:underline"
+                        >
+                          Clear
+                        </button>
+                      </div>
+                      <div className="max-h-64 space-y-1 overflow-y-auto rounded-lg border border-border p-2">
+                        {members
+                          .filter((m) => {
+                            const q = memberSearch.trim().toLowerCase();
+                            return (
+                              !q ||
+                              (m.name ?? '').toLowerCase().includes(q) ||
+                              m.phone.includes(q)
+                            );
+                          })
+                          .map((m) => (
+                            <label
+                              key={m.id}
+                              className="flex cursor-pointer items-center gap-2 rounded px-1 py-1 text-xs hover:bg-muted"
+                            >
+                              <Checkbox
+                                checked={!audience.excludeContactIds?.includes(m.id)}
+                                onCheckedChange={() => toggleMember(m.id)}
+                              />
+                              <span className="text-foreground">
+                                {m.name || m.phone}
+                              </span>
+                              {m.name && (
+                                <span className="text-muted-foreground">{m.phone}</span>
+                              )}
+                            </label>
+                          ))}
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
             </div>
           )}
         </div>

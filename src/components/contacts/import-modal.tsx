@@ -119,12 +119,15 @@ interface ImportModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onImported: () => void;
+  /** When set, every imported number is also added to this group. */
+  targetGroup?: { id: string; name: string } | null;
 }
 
 export function ImportModal({
   open,
   onOpenChange,
   onImported,
+  targetGroup = null,
 }: ImportModalProps) {
   const t = useTranslations('Contacts.importModal');
   const supabase = createClient();
@@ -144,6 +147,7 @@ export function ImportModal({
     skipped: number;
     failed: number;
     tagsAssigned: number;
+    addedToGroup: number;
   } | null>(null);
 
   function reset() {
@@ -240,13 +244,21 @@ export function ImportModal({
           .filter((p): p is string => !!p)
       );
 
+      // Numbers already in the account are not re-created, but when we are
+      // importing into a group they still have to join that group.
+      const existingPhoneKeys: string[] = [];
       const toInsert = unique.filter((row) => {
-        if (existing.has(normalizeKey(row.phone))) {
+        const key = normalizeKey(row.phone);
+        if (existing.has(key)) {
           skipped++;
+          existingPhoneKeys.push(key);
           return false;
         }
         return true;
       });
+
+      // Ids of every contact that must end up in the target group.
+      const groupContactIds = new Set<string>();
 
       // 3) Resolve tag names → ids (admin+ may auto-create missing tags).
       //    Skip the round-trip when the import carries no tag names.
@@ -299,6 +311,7 @@ export function ImportModal({
 
             if (!singleErr && singleData) {
               imported++;
+              groupContactIds.add(singleData.id);
               if (source.tagNames.length > 0) {
                 tagAssignments.push({
                   contactId: singleData.id,
@@ -314,6 +327,7 @@ export function ImportModal({
         } else {
           const inserted = data ?? [];
           imported += inserted.length;
+          for (const r of inserted) groupContactIds.add(r.id);
           // inserted[j] ↔ chunk[j] only holds because a single INSERT
           // preserves RETURNING order. If this path is ever split into
           // parallel inserts, zip by phone or returned id instead.
@@ -341,7 +355,45 @@ export function ImportModal({
         toast.warning(t('toastTagsWarning'));
       }
 
-      setResult({ imported, skipped, failed, tagsAssigned });
+      // 6) Put everything into the group the user is importing into:
+      //    the newly created contacts plus numbers that already existed.
+      let addedToGroup = 0;
+      if (targetGroup) {
+        try {
+          const CHUNK = 200;
+          for (let i = 0; i < existingPhoneKeys.length; i += CHUNK) {
+            const { data: found } = await supabase
+              .from('contacts')
+              .select('id')
+              .eq('account_id', accountId)
+              .in('phone_normalized', existingPhoneKeys.slice(i, i + CHUNK));
+            for (const r of found ?? []) groupContactIds.add(r.id);
+          }
+
+          const rows = [...groupContactIds].map((id) => ({
+            contact_id: id,
+            tag_id: targetGroup.id,
+          }));
+          for (let i = 0; i < rows.length; i += 100) {
+            const { error } = await supabase
+              .from('contact_tags')
+              .upsert(rows.slice(i, i + 100), {
+                onConflict: 'contact_id,tag_id',
+                ignoreDuplicates: true,
+              });
+            if (error) throw error;
+          }
+          addedToGroup = rows.length;
+        } catch {
+          toast.warning(`Contacts were imported but could not be added to "${targetGroup.name}"`);
+        }
+      }
+
+      setResult({ imported, skipped, failed, tagsAssigned, addedToGroup });
+      if (targetGroup && addedToGroup > 0) {
+        toast.success(`${addedToGroup} contacts are now in "${targetGroup.name}"`);
+        onImported();
+      }
       if (imported > 0) {
         toast.success(t('toastImported', { count: imported }));
         onImported();
@@ -410,6 +462,15 @@ export function ImportModal({
               }}
             />
           </DialogHeader>
+
+          {targetGroup && (
+            <div className="rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-sm text-foreground">
+              Importing into group: <span className="font-semibold">{targetGroup.name}</span>
+              <span className="block text-xs text-muted-foreground">
+                Every number in the file will be added to this group, including numbers that already exist in your contacts.
+              </span>
+            </div>
+          )}
 
           <div
             role="button"
@@ -572,6 +633,12 @@ export function ImportModal({
                   <div className="text-primary flex items-center gap-1.5 text-sm">
                     <CheckCircle className="size-4 shrink-0" />
                     {t('resultImported', { count: result.imported })}
+                  </div>
+                )}
+                {targetGroup && result.addedToGroup > 0 && (
+                  <div className="text-primary flex items-center gap-1.5 text-sm">
+                    <CheckCircle className="size-4 shrink-0" />
+                    {result.addedToGroup} added to “{targetGroup.name}”
                   </div>
                 )}
                 {result.tagsAssigned > 0 && (

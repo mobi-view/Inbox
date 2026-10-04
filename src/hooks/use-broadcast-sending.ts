@@ -24,6 +24,8 @@ export interface AudienceConfig {
   csvContacts?: { phone: string; name?: string }[];
   /** Contacts carrying any of these tags are subtracted from the result. */
   excludeTagIds?: string[];
+  /** Individual contacts unticked by the user; removed from the result. */
+  excludeContactIds?: string[];
 }
 
 /**
@@ -211,6 +213,13 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
       contacts = contacts.filter((c) => !excludedIds.has(c.id));
     }
 
+    // Apply individually unticked contacts (lets the user pick only some
+    // members of a tag instead of sending to the whole group).
+    if (audience.excludeContactIds && audience.excludeContactIds.length > 0) {
+      const skip = new Set(audience.excludeContactIds);
+      contacts = contacts.filter((c) => !skip.has(c.id));
+    }
+
     return contacts;
   }
 
@@ -376,6 +385,7 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
             tagIds: payload.audience.tagIds,
             customField: payload.audience.customField,
             excludeTagIds: payload.audience.excludeTagIds,
+            excludeContactIds: payload.audience.excludeContactIds,
           },
           status: 'sending',
           total_recipients: contacts.length,

@@ -314,6 +314,9 @@
       "selectedCount": "{count}개 선택됨",
       "clearSelection": "지우기",
       "deleteSelected": "선택 항목 삭제",
+      "addToGroup": "그룹에 추가",
+      "toastBulkGroupAdded": "{count}명을 \"{name}\"에 추가했습니다",
+      "toastBulkGroupFailed": "{count}명 추가에 실패했습니다",
       "tableColumns": {
         "name": "이름",
         "phone": "전화번호",

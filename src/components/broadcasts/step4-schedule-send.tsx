@@ -21,6 +21,7 @@ interface AudienceConfig {
   type: string;
   tagIds?: string[];
   csvContacts?: { phone: string; name?: string }[];
+  excludeContactIds?: string[];
 }
 
 interface Step4Props {
@@ -69,6 +70,7 @@ export function Step4ScheduleSend({
             .in('tag_id', audience.tagIds);
 
           const uniqueIds = new Set((contactTags ?? []).map((ct) => ct.contact_id));
+          for (const id of audience.excludeContactIds ?? []) uniqueIds.delete(id);
           setEstimatedReach(uniqueIds.size);
         } else if (audience.type === 'csv' && audience.csvContacts) {
           setEstimatedReach(audience.csvContacts.length);

@@ -49,6 +49,7 @@ import {
   SlidersHorizontal,
   Filter,
   X,
+  Tag as TagIcon,
 } from 'lucide-react';
 import { ContactForm } from '@/components/contacts/contact-form';
 import { ContactDetailView } from '@/components/contacts/contact-detail-view';
@@ -57,6 +58,9 @@ import { CustomFieldsManager } from '@/components/contacts/custom-fields-manager
 import { useCan } from '@/hooks/use-can';
 import { GatedButton } from '@/components/ui/gated-button';
 import { useTranslations } from 'next-intl';
+import { addContactTag, deleteContactTag } from '@/lib/contacts/tag-api';
+import { GroupsBar } from '@/components/contacts/groups-bar';
+import { AddContactsToGroupDialog } from '@/components/contacts/add-contacts-to-group-dialog';
 
 const PAGE_SIZE = 25;
 
@@ -85,6 +89,8 @@ export default function ContactsPage() {
   const [detailOpen, setDetailOpen] = useState(false);
   const [detailContactId, setDetailContactId] = useState<string | null>(null);
   const [importOpen, setImportOpen] = useState(false);
+  // Group the next import is added to (null = plain import, no group).
+  const [importGroup, setImportGroup] = useState<{ id: string; name: string } | null>(null);
   const [customFieldsOpen, setCustomFieldsOpen] = useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Contact | null>(null);
@@ -96,6 +102,12 @@ export default function ContactsPage() {
 
   // All tags for display
   const [tagsMap, setTagsMap] = useState<Record<string, Tag>>({});
+
+  // Groups (tags) overview: member count per group + total contacts.
+  const [groupCounts, setGroupCounts] = useState<Record<string, number>>({});
+  const [allCount, setAllCount] = useState(0);
+  const [addToGroupOpen, setAddToGroupOpen] = useState(false);
+  const [bulkRemoving, setBulkRemoving] = useState(false);
 
   // Guards against out-of-order fetch responses: each fetchContacts run
   // claims a sequence number and only the latest is allowed to commit its
@@ -116,6 +128,25 @@ export default function ContactsPage() {
         return pruned.length === prev.length ? prev : pruned;
       });
     }
+  }, [supabase]);
+
+  const fetchGroupCounts = useCallback(async () => {
+    const { data: tagRows } = await supabase.from('tags').select('id');
+    const [{ count: total }, ...perTag] = await Promise.all([
+      supabase.from('contacts').select('*', { count: 'exact', head: true }),
+      ...(tagRows ?? []).map((tg) =>
+        supabase
+          .from('contact_tags')
+          .select('*', { count: 'exact', head: true })
+          .eq('tag_id', tg.id),
+      ),
+    ]);
+    const counts: Record<string, number> = {};
+    (tagRows ?? []).forEach((tg, i) => {
+      counts[tg.id] = perTag[i]?.count ?? 0;
+    });
+    setGroupCounts(counts);
+    setAllCount(total ?? 0);
   }, [supabase]);
 
   const fetchContacts = useCallback(async () => {
@@ -216,7 +247,8 @@ export default function ContactsPage() {
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchTags();
-  }, [fetchTags]);
+    fetchGroupCounts();
+  }, [fetchTags, fetchGroupCounts]);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -295,6 +327,67 @@ export default function ContactsPage() {
     });
   }
 
+  // The group currently opened (exactly one tag selected as filter).
+  const activeGroupId = selectedTagIds.length === 1 ? selectedTagIds[0] : null;
+  const activeGroup = activeGroupId ? tagsMap[activeGroupId] ?? null : null;
+
+  function selectGroup(groupId: string | null) {
+    setSelectedTagIds(groupId ? [groupId] : []);
+    setPage(0);
+  }
+
+  async function handleBulkRemoveFromGroup() {
+    if (!activeGroupId) return;
+    const ids = [...selected];
+    if (ids.length === 0) return;
+    setBulkRemoving(true);
+    let failed = 0;
+    for (let i = 0; i < ids.length; i += 5) {
+      const res = await Promise.allSettled(
+        ids.slice(i, i + 5).map((id) => deleteContactTag(id, activeGroupId)),
+      );
+      failed += res.filter((r) => r.status === 'rejected').length;
+    }
+    setBulkRemoving(false);
+    if (failed > 0) toast.error(`Failed to remove ${failed} contacts`);
+    else toast.success(`Removed ${ids.length} from "${activeGroup?.name ?? 'group'}"`);
+    setSelected(new Set());
+    fetchContacts();
+    fetchGroupCounts();
+  }
+
+  // Add every selected contact to a group (tag). A contact can belong to
+  // several groups; adding an existing membership is a harmless no-op.
+  const [bulkTagging, setBulkTagging] = useState(false);
+
+  async function handleBulkAddToGroup(tagId: string) {
+    const ids = [...selected];
+    if (ids.length === 0) return;
+    setBulkTagging(true);
+    let failed = 0;
+    const CONCURRENCY = 5;
+    for (let i = 0; i < ids.length; i += CONCURRENCY) {
+      const results = await Promise.allSettled(
+        ids.slice(i, i + CONCURRENCY).map((id) => addContactTag(id, tagId)),
+      );
+      failed += results.filter((r) => r.status === 'rejected').length;
+    }
+    setBulkTagging(false);
+    if (failed > 0) {
+      toast.error(t('toastBulkGroupFailed', { count: failed }));
+    } else {
+      toast.success(
+        t('toastBulkGroupAdded', {
+          count: ids.length,
+          name: tagsMap[tagId]?.name ?? '',
+        }),
+      );
+    }
+    setSelected(new Set());
+    fetchContacts();
+    fetchGroupCounts();
+  }
+
   async function handleBulkDelete() {
     const ids = [...selected];
     if (ids.length === 0) return;
@@ -308,6 +401,7 @@ export default function ContactsPage() {
       toast.success(t('toastBulkDeleted', { count: ids.length }));
       setSelected(new Set());
       fetchContacts();
+      fetchGroupCounts();
     }
 
     setDeleting(false);
@@ -364,7 +458,13 @@ export default function ContactsPage() {
             variant="outline"
             canAct={canEdit}
             gateReason="add or import contacts"
-            onClick={() => setImportOpen(true)}
+            onClick={() => {
+              // Inside an opened group, the header import also targets it.
+              setImportGroup(
+                activeGroup ? { id: activeGroup.id, name: activeGroup.name } : null,
+              );
+              setImportOpen(true);
+            }}
             className="border-border text-muted-foreground hover:bg-muted"
           >
             <Upload className="size-4" />
@@ -381,6 +481,64 @@ export default function ContactsPage() {
           </GatedButton>
         </div>
       </div>
+
+      {/* Groups */}
+      <GroupsBar
+        groups={Object.values(tagsMap).sort((a, b) => a.name.localeCompare(b.name))}
+        counts={groupCounts}
+        allCount={allCount}
+        activeGroupId={activeGroupId}
+        onSelect={selectGroup}
+        onCreated={() => {
+          fetchTags();
+          fetchGroupCounts();
+        }}
+        canCreate={canEdit}
+        onImport={(g) => {
+          setImportGroup({ id: g.id, name: g.name });
+          setImportOpen(true);
+        }}
+      />
+
+      {activeGroup && (
+        <div
+          className="flex flex-col gap-3 rounded-xl border p-4 sm:flex-row sm:items-center sm:justify-between"
+          style={{ borderColor: `${activeGroup.color}55`, backgroundColor: `${activeGroup.color}0f` }}
+        >
+          <div>
+            <p className="text-sm font-semibold text-foreground">
+              Group: {activeGroup.name}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              {groupCounts[activeGroup.id] ?? 0} contacts in this group
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <GatedButton
+              size="sm"
+              variant="outline"
+              canAct={canEdit}
+              gateReason="import contacts"
+              onClick={() => {
+                setImportGroup({ id: activeGroup.id, name: activeGroup.name });
+                setImportOpen(true);
+              }}
+            >
+              <Upload className="size-4" />
+              Import into this group
+            </GatedButton>
+            <GatedButton
+              size="sm"
+              canAct={canEdit}
+              gateReason="edit groups"
+              onClick={() => setAddToGroupOpen(true)}
+            >
+              <Plus className="size-4" />
+              Add contacts to this group
+            </GatedButton>
+          </div>
+        </div>
+      )}
 
       {/* Search + tag filter */}
       <div className="space-y-2">
@@ -513,6 +671,55 @@ export default function ContactsPage() {
             >
               {t('clearSelection')}
             </Button>
+            {activeGroupId && (
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={bulkRemoving || !canEdit}
+                onClick={handleBulkRemoveFromGroup}
+              >
+                {bulkRemoving ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <X className="size-4" />
+                )}
+                Remove from group
+              </Button>
+            )}
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                render={
+                  <Button variant="outline" size="sm" disabled={bulkTagging || !canEdit} />
+                }
+              >
+                {bulkTagging ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <TagIcon className="size-4" />
+                )}
+                {t('addToGroup')}
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="max-h-72 overflow-y-auto">
+                {allTags.length === 0 ? (
+                  <div className="px-2 py-1.5 text-xs text-muted-foreground">
+                    {t('noTagsYet')}
+                  </div>
+                ) : (
+                  allTags.map((tag) => (
+                    <DropdownMenuItem
+                      key={tag.id}
+                      onClick={() => handleBulkAddToGroup(tag.id)}
+                    >
+                      <span
+                        className="mr-2 h-2 w-2 rounded-full"
+                        style={{ backgroundColor: tag.color }}
+                      />
+                      {tag.name}
+                    </DropdownMenuItem>
+                  ))
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
             <GatedButton
               variant="destructive"
               size="sm"
@@ -729,6 +936,17 @@ export default function ContactsPage() {
         </div>
       )}
 
+      {/* Add numbers to the opened group */}
+      <AddContactsToGroupDialog
+        open={addToGroupOpen}
+        onOpenChange={setAddToGroupOpen}
+        group={activeGroup}
+        onDone={() => {
+          fetchContacts();
+          fetchGroupCounts();
+        }}
+      />
+
       {/* Contact Form Dialog */}
       <ContactForm
         open={formOpen}
@@ -738,6 +956,7 @@ export default function ContactsPage() {
         onSaved={() => {
           fetchContacts();
           fetchTags();
+          fetchGroupCounts();
         }}
         onViewExisting={(id) => {
           setFormOpen(false);
@@ -757,7 +976,11 @@ export default function ContactsPage() {
       <ImportModal
         open={importOpen}
         onOpenChange={setImportOpen}
-        onImported={fetchContacts}
+        targetGroup={importGroup}
+        onImported={() => {
+          fetchContacts();
+          fetchGroupCounts();
+        }}
       />
 
       {/* Custom Fields Manager (admin+) */}
