@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
+import { findExistingContact, isUniqueViolation } from "@/lib/contacts/dedupe";
+import { normalizePhone } from "@/lib/whatsapp/phone-utils";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -214,17 +216,16 @@ export async function POST(request: NextRequest) {
 
     let contact;
 
-    const { data: existingContact, error: contactFindError } =
-      await supabaseAdmin
-        .from("contacts")
-        .select("*")
-        .eq("account_id", accountId)
-        .eq("phone", phone)
-        .maybeSingle();
-
-    if (contactFindError) {
-      console.error("[Gupshup] Contact lookup error:", contactFindError);
-    }
+    // Match on the digits-only form, not the raw string: contacts imported
+    // from a file are often stored as "+972 59-..." while Gupshup sends
+    // "97259...". An exact `.eq("phone", phone)` missed those, then the
+    // insert below collided with the unique phone_normalized index and the
+    // inbound message was dropped.
+    const existingContact = await findExistingContact(
+      supabaseAdmin,
+      accountId,
+      phone
+    );
 
     // ---------------------------------------------------------
     // 5. Existing contact
@@ -271,7 +272,21 @@ export async function POST(request: NextRequest) {
           .select("*")
           .single();
 
-      if (contactCreateError) {
+      if (contactCreateError && isUniqueViolation(contactCreateError)) {
+        // Backstop: the number already exists in some stored format (or a
+        // racing webhook just created it). Reuse that contact instead of
+        // dropping the message.
+        const { data: sameNumber } = await supabaseAdmin
+          .from("contacts")
+          .select("*")
+          .eq("account_id", accountId)
+          .eq("phone_normalized", normalizePhone(phone))
+          .maybeSingle();
+
+        if (sameNumber) {
+          contact = sameNumber;
+        }
+      } else if (contactCreateError) {
         console.error("[Gupshup] Contact creation error:", contactCreateError);
 
         return NextResponse.json(
@@ -282,9 +297,21 @@ export async function POST(request: NextRequest) {
           },
           { status: 500 }
         );
+      } else {
+        contact = newContact;
       }
 
-      contact = newContact;
+      if (!contact) {
+        console.error("[Gupshup] Could not resolve contact for", phone);
+
+        return NextResponse.json(
+          {
+            success: false,
+            error: "Failed to create contact",
+          },
+          { status: 500 }
+        );
+      }
     }
 
     console.log("[Gupshup] Contact:", contact.id);

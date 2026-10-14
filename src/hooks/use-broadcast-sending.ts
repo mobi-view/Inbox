@@ -8,6 +8,12 @@ import {
   batchRetryDelayMs,
 } from '@/lib/broadcast-retry';
 import { Contact, MessageTemplate } from '@/types';
+import {
+  fetchAllContacts,
+  fetchContactIdsForTags,
+  fetchContactsByIds,
+  IN_CHUNK,
+} from '@/lib/broadcast-audience';
 
 export type CustomFieldOperator = 'is' | 'is_not' | 'contains';
 
@@ -139,9 +145,9 @@ async function fetchCustomValueIndex(
   const index: CustomValueIndex = new Map();
   if (contactIds.length === 0) return index;
 
-  // Supabase PostgREST caps the .in(...) IN-clause roughly at 1000
-  // values. Page through to stay safe.
-  const PAGE = 500;
+  // `.in(...)` values travel in the request URL, so keep slices small or
+  // large audiences fail with "Bad Request".
+  const PAGE = IN_CHUNK;
   for (let i = 0; i < contactIds.length; i += PAGE) {
     const slice = contactIds.slice(i, i + PAGE);
     const { data } = await supabase
@@ -169,33 +175,16 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
     let contacts: Contact[] = [];
 
     if (audience.type === 'all') {
-      const { data, error } = await supabase.from('contacts').select('*');
-      if (error) throw new Error(`Failed to fetch contacts: ${error.message}`);
-      contacts = data ?? [];
+      contacts = await fetchAllContacts(supabase);
     } else if (
       audience.type === 'tags' &&
       audience.tagIds &&
       audience.tagIds.length > 0
     ) {
-      const { data: contactTags, error: tagError } = await supabase
-        .from('contact_tags')
-        .select('contact_id')
-        .in('tag_id', audience.tagIds);
-
-      if (tagError)
-        throw new Error(`Failed to fetch contact tags: ${tagError.message}`);
-
-      if (contactTags && contactTags.length > 0) {
-        const uniqueContactIds = [
-          ...new Set(contactTags.map((ct) => ct.contact_id)),
-        ];
-        const { data, error } = await supabase
-          .from('contacts')
-          .select('*')
-          .in('id', uniqueContactIds);
-        if (error) throw new Error(`Failed to fetch contacts: ${error.message}`);
-        contacts = data ?? [];
-      }
+      // Paged id lookup + chunked contact fetch: a big group otherwise
+      // overflows the request URL ("Bad Request") or is cut at 1000 rows.
+      const contactIds = await fetchContactIdsForTags(supabase, audience.tagIds);
+      contacts = await fetchContactsByIds(supabase, contactIds);
     } else if (audience.type === 'custom_field' && audience.customField) {
       contacts = await resolveCustomFieldAudience(supabase, audience.customField);
     } else if (audience.type === 'csv' && audience.csvContacts) {
@@ -205,11 +194,9 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
     // Apply exclude tags (works across all contact-derived audience
     // types). CSV contacts are synthetic so exclusion doesn't apply.
     if (audience.excludeTagIds && audience.excludeTagIds.length > 0) {
-      const { data: excludeRows } = await supabase
-        .from('contact_tags')
-        .select('contact_id')
-        .in('tag_id', audience.excludeTagIds);
-      const excludedIds = new Set((excludeRows ?? []).map((r) => r.contact_id));
+      const excludedIds = new Set(
+        await fetchContactIdsForTags(supabase, audience.excludeTagIds),
+      );
       contacts = contacts.filter((c) => !excludedIds.has(c.id));
     }
 
@@ -258,14 +245,18 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
     }
     const phones = [...uniqueByPhone.keys()];
 
-    // Single round-trip lookup of existing contacts by phone.
-    const { data: existing, error: lookupErr } = await supabase
-      .from('contacts')
-      .select('*')
-      .eq('user_id', user.id)
-      .in('phone', phones);
-    if (lookupErr) {
-      throw new Error(`Failed to look up CSV contacts: ${lookupErr.message}`);
+    // Chunked lookup of existing contacts by phone (URL-length safe).
+    const existing: Contact[] = [];
+    for (let i = 0; i < phones.length; i += IN_CHUNK) {
+      const { data, error: lookupErr } = await supabase
+        .from('contacts')
+        .select('*')
+        .eq('user_id', user.id)
+        .in('phone', phones.slice(i, i + IN_CHUNK));
+      if (lookupErr) {
+        throw new Error(`Failed to look up CSV contacts: ${lookupErr.message}`);
+      }
+      existing.push(...((data ?? []) as Contact[]));
     }
 
     const byPhone = new Map<string, Contact>();
@@ -330,12 +321,7 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
     const contactIds = [...new Set((matches ?? []).map((m) => m.contact_id))];
     if (contactIds.length === 0) return [];
 
-    const { data, error } = await supabase
-      .from('contacts')
-      .select('*')
-      .in('id', contactIds);
-    if (error) throw new Error(`Failed to fetch contacts: ${error.message}`);
-    return data ?? [];
+    return fetchContactsByIds(supabase, contactIds);
   }
 
   async function createAndSendBroadcast(payload: BroadcastPayload): Promise<string> {
